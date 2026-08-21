@@ -1,10 +1,8 @@
-import { getEnv } from "./_lib.js";
+import { ENV, keyKind, keyDiagnostics, serviceHeaders } from "./_lib.js";
 
 export default async function handler(req, res) {
-  const env = getEnv();
-
-  const url = env.supabaseUrl;
-  const key = env.serviceKey;
+  const url = ENV.sbUrl;
+  const key = ENV.sbService;
 
   if (!url || !key) {
     return res.status(500).json({
@@ -13,17 +11,12 @@ export default async function handler(req, res) {
     });
   }
 
-  const isLegacyJwt = key.startsWith("eyJ");
+  const base =
+    url.replace(/\/+$/, "").replace(/\/rest\/v1$/, "") + "/rest/v1";
 
-  const headers = {
-    apikey: key
-  };
+  const mode = keyKind() === "legacy JWT" ? "both" : "apikey";
 
-  if (isLegacyJwt) {
-    headers.Authorization = `Bearer ${key}`;
-  }
-
-  const base = `${url.replace(/\/+$/, "")}/rest/v1`;
+  const headers = serviceHeaders(null, mode);
 
   const probes = [
     {
@@ -51,7 +44,7 @@ export default async function handler(req, res) {
   const results = [];
 
   for (const probe of probes) {
-    const target = `${base}${probe.path}`;
+    const target = base + probe.path;
 
     try {
       const response = await fetch(target, {
@@ -61,37 +54,61 @@ export default async function handler(req, res) {
 
       const text = await response.text();
 
-      let parsed;
+      let body = null;
       try {
-        parsed = text ? JSON.parse(text) : null;
+        body = text ? JSON.parse(text) : null;
       } catch {
-        parsed = text;
+        body = text;
       }
 
       results.push({
         label: probe.label,
         url: target,
-        sentHeaders: isLegacyJwt
-          ? ["apikey", "Authorization: Bearer <redacted>"]
-          : ["apikey"],
+        sentHeaders:
+          mode === "both"
+            ? ["apikey", "Authorization: Bearer <redacted>"]
+            : ["apikey"],
         status: response.status,
-        ok: response.ok,
-        response: parsed
+        code: body && body.code ? body.code : null,
+        message: body && body.message ? body.message : "",
+        ok: response.ok
       });
     } catch (error) {
       results.push({
         label: probe.label,
         url: target,
-        sentHeaders: isLegacyJwt
-          ? ["apikey", "Authorization: Bearer <redacted>"]
-          : ["apikey"],
-        error: error.message
+        sentHeaders:
+          mode === "both"
+            ? ["apikey", "Authorization: Bearer <redacted>"]
+            : ["apikey"],
+        status: 0,
+        code: null,
+        message: error.message,
+        ok: false
       });
     }
   }
 
+  const orders = results.find(r => r.label === "cng_orders");
+  const vendors = results.find(r => r.label === "cng_vendors");
+
+  let verdict;
+
+  if (orders?.ok && vendors?.ok) {
+    verdict =
+      "SUCCESS: service_role can read cng_orders and cng_vendors.";
+  } else if (orders?.status === 403 || vendors?.status === 403) {
+    verdict =
+      "Permission is still being denied on one or more tables.";
+  } else if (orders?.status === 401 || vendors?.status === 401) {
+    verdict =
+      "The legacy service_role JWT was rejected.";
+  } else {
+    verdict =
+      "The request reached Supabase, but one or more probes failed.";
+  }
+
   return res.status(200).json({
-    ok: results.every((r) => r.ok),
     projectRefFromUrl: (() => {
       try {
         return new URL(url).hostname.split(".")[0];
@@ -99,20 +116,20 @@ export default async function handler(req, res) {
         return null;
       }
     })(),
-    key: {
-      present: true,
-      length: key.length,
-      prefix: key.slice(0, 11) + "…",
-      format: isLegacyJwt ? "legacy JWT" : "new secret",
-      hadSurroundingWhitespace: key !== key.trim(),
-      hadWrappingQuotes:
-        (key.startsWith('"') && key.endsWith('"')) ||
-        (key.startsWith("'") && key.endsWith("'")),
-      containsInnerWhitespace: /\s/.test(key.trim())
-    },
-    headerPolicy: isLegacyJwt
-      ? "apikey + Authorization Bearer"
-      : "apikey only",
-    probes: results
+
+    urlUsed: url,
+
+    key: keyDiagnostics(),
+
+    keyFormat: keyKind(),
+
+    headerPolicy:
+      mode === "both"
+        ? "apikey + Authorization Bearer"
+        : "apikey only",
+
+    probes: results,
+
+    verdict
   });
 }
